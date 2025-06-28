@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>どうぶつライフ</title>
+    <style>
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            flex-direction: column;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f8ff;
+            font-family: 'Helvetica Neue', Arial, 'Hiragino Kaku Gothic ProN', 'Hiragino Sans', Meiryo, sans-serif;
+            color: #333;
+        }
+        #game-container {
+            border: 5px solid #8b5e34;
+            border-radius: 15px;
+            box-shadow: 0 10px 20px rgba(0,0,0,0.2);
+            background-color: #000;
+            position: relative;
+        }
+        canvas {
+            display: block;
+            border-radius: 10px;
+        }
+        #info-panel {
+            margin-top: 15px;
+            padding: 10px 20px;
+            background-color: #fff;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        #info-panel h1 {
+            margin: 0 0 5px 0;
+            color: #5a4a42;
+        }
+        #info-panel p {
+            margin: 0;
+            font-size: 0.9em;
+        }
+        #user-id-display {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(255, 255, 255, 0.7);
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div id="info-panel">
+        <h1>どうぶつライフ</h1>
+        <p>矢印キーで移動 | 動物の近くで 'E' キーを押して話す</p>
+    </div>
+    <div id="game-container">
+        <canvas id="gameCanvas"></canvas>
+        <div id="user-id-display">接続中...</div>
+    </div>
+
+    <script type="module">
+        // Firebase モジュールのインポート
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getFirestore, doc, setDoc, onSnapshot, updateDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+
+        // --- ゲーム設定 ---
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        const TILE_SIZE = 40;
+        const MAP_WIDTH_TILES = 20;
+        const MAP_HEIGHT_TILES = 15;
+
+        canvas.width = TILE_SIZE * MAP_WIDTH_TILES;
+        canvas.height = TILE_SIZE * MAP_HEIGHT_TILES;
+
+        // --- Firebase 初期化 ---
+        // Canvas環境から提供されるグローバル変数を使用
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-animal-life';
+        
+        let app, db, auth, userId;
+        let unsubscribePlayer; // プレイヤーデータのonSnapshotリスナーを保持
+
+        // --- ゲーム状態 ---
+        let player = {
+            x: canvas.width / 2,
+            y: canvas.height / 2,
+            size: TILE_SIZE * 0.6,
+            speed: 3,
+            color: '#3498db'
+        };
+
+        const keys = {
+            ArrowUp: false,
+            ArrowDown: false,
+            ArrowLeft: false,
+            ArrowRight: false,
+        };
+
+        let worldObjects = [
+            // 家
+            { type: 'house', x: 2, y: 2, width: 3, height: 2 },
+            // 木
+            { type: 'tree', x: 8, y: 5 },
+            { type: 'tree', x: 15, y: 10 },
+            { type: 'tree', x: 4, y: 12 },
+            { type: 'tree', x: 18, y: 3 },
+        ];
+        
+        let villagers = [
+            { id: 'cat', name: 'タマ', x: TILE_SIZE * 10, y: TILE_SIZE * 8, size: TILE_SIZE * 0.6, color: '#f39c12', message: 'ニャー！いい天気だニャ。' },
+            { id: 'dog', name: 'ポチ', x: TILE_SIZE * 5, y: TILE_SIZE * 5, size: TILE_SIZE * 0.6, color: '#a0522d', message: 'ワン！何か面白いことないかな？' }
+        ];
+
+        let currentDialogue = null;
+        let dialogueTimeout;
+        let lastSaveTime = 0;
+        const SAVE_INTERVAL = 2000; // 2秒ごとに保存
+
+        // --- Firebase 接続 ---
+        async function setupFirebase() {
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // Firestoreのログレベルを設定 (デバッグ用)
+                // setLogLevel('debug');
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        document.getElementById('user-id-display').textContent = `UserID: ${userId}`;
+                        console.log("Authenticated with UID:", userId);
+                        await loadPlayerData();
+                    } else {
+                        console.log("User is not signed in.");
+                        document.getElementById('user-id-display').textContent = '匿名ユーザー';
+                    }
+                });
+
+                // 認証トークンがあれば使用、なければ匿名認証
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    try {
+                        // まずカスタムトークンでサインインを試みる
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } catch (customTokenError) {
+                        // カスタムトークンが失敗した場合、エラーを記録して匿名認証にフォールバックする
+                        console.error("カスタムトークンでのサインインに失敗しました:", customTokenError);
+                        console.log("匿名認証にフォールバックします。");
+                        await signInAnonymously(auth);
+                    }
+                } else {
+                    // トークンがない場合は匿名でサインイン
+                    await signInAnonymously(auth);
+                }
+
+            } catch (error) {
+                console.error("Firebaseの初期化に失敗しました:", error);
+                document.getElementById('user-id-display').textContent = '接続エラー';
+            }
+        }
+
+        // --- データロードと保存 ---
+        async function loadPlayerData() {
+            if (!userId) return;
+            
+            const playerDocRef = doc(db, `artifacts/${appId}/public/data/animal-life`, userId);
+            
+            // onSnapshotでリアルタイムの変更を監視
+            unsubscribePlayer = onSnapshot(playerDocRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    // 他のブラウザからの更新でない場合のみ、ローカルの状態を更新
+                    // (自分自身の書き込みによるスナップショットも受け取るため)
+                    // 今回はシンプルにするため、常に最新データで上書きする
+                    player.x = data.x;
+                    player.y = data.y;
+                    console.log("プレイヤーデータを読み込みました:", data);
+                } else {
+                    console.log("プレイヤーデータが存在しません。新規作成します。");
+                    // 初期位置でデータを作成
+                    savePlayerData(true); 
+                }
+            }, (error) => {
+                console.error("データの監視に失敗しました:", error);
+            });
+        }
+
+        async function savePlayerData(force = false) {
+            if (!userId) return;
+
+            const now = Date.now();
+            // 強制保存でない場合は、インターバルをチェック
+            if (!force && now - lastSaveTime < SAVE_INTERVAL) {
+                return;
+            }
+            lastSaveTime = now;
+
+            try {
+                const playerDocRef = doc(db, `artifacts/${appId}/public/data/animal-life`, userId);
+                await setDoc(playerDocRef, { x: player.x, y: player.y, lastUpdate: now }, { merge: true });
+                console.log("プレイヤーデータを保存しました:", { x: player.x, y: player.y });
+            } catch (error) {
+                console.error("データの保存に失敗しました:", error);
+            }
+        }
+
+
+        // --- 入力ハンドラ ---
+        window.addEventListener('keydown', (e) => {
+            if (keys.hasOwnProperty(e.key)) {
+                keys[e.key] = true;
+            }
+            if (e.key === 'e' || e.key === 'E') {
+                interact();
+            }
+        });
+        window.addEventListener('keyup', (e) => {
+            if (keys.hasOwnProperty(e.key)) {
+                keys[e.key] = false;
+            }
+        });
+
+        // --- ゲームロジック ---
+        function update() {
+            const oldX = player.x;
+            const oldY = player.y;
+
+            // プレイヤーの移動
+            let dx = 0;
+            let dy = 0;
+            if (keys.ArrowUp) dy -= player.speed;
+            if (keys.ArrowDown) dy += player.speed;
+            if (keys.ArrowLeft) dx -= player.speed;
+            if (keys.ArrowRight) dx += player.speed;
+
+            // 斜め移動の速度補正
+            if (dx !== 0 && dy !== 0) {
+                dx /= Math.sqrt(2);
+                dy /= Math.sqrt(2);
+            }
+
+            const newX = player.x + dx;
+            const newY = player.y + dy;
+
+            // 衝突判定
+            if (!checkCollision(newX, newY)) {
+                player.x = newX;
+                player.y = newY;
+            } else if (!checkCollision(newX, player.y)) {
+                player.x = newX;
+            } else if (!checkCollision(player.x, newY)) {
+                player.y = newY;
+            }
+            
+            // 境界チェック
+            player.x = Math.max(player.size, Math.min(canvas.width - player.size, player.x));
+            player.y = Math.max(player.size, Math.min(canvas.height - player.size, player.y));
+            
+            // 位置が変更された場合、保存を試みる
+            if (player.x !== oldX || player.y !== oldY) {
+                savePlayerData();
+            }
+        }
+        
+        function checkCollision(x, y) {
+            const playerRect = {
+                left: x - player.size,
+                right: x + player.size,
+                top: y - player.size,
+                bottom: y + player.size
+            };
+
+            for (const obj of worldObjects) {
+                let objRect;
+                if (obj.type === 'tree') {
+                    const trunkWidth = TILE_SIZE * 0.4;
+                    objRect = {
+                        left: obj.x * TILE_SIZE + (TILE_SIZE - trunkWidth) / 2,
+                        right: obj.x * TILE_SIZE + (TILE_SIZE + trunkWidth) / 2,
+                        top: obj.y * TILE_SIZE + TILE_SIZE * 0.5,
+                        bottom: obj.y * TILE_SIZE + TILE_SIZE,
+                    };
+                } else if (obj.type === 'house') {
+                     objRect = {
+                        left: obj.x * TILE_SIZE,
+                        right: (obj.x + obj.width) * TILE_SIZE,
+                        top: obj.y * TILE_SIZE,
+                        bottom: (obj.y + obj.height) * TILE_SIZE,
+                    };
+                }
+                
+                if (objRect && playerRect.right > objRect.left && playerRect.left < objRect.right &&
+                    playerRect.bottom > objRect.top && playerRect.top < objRect.bottom) {
+                    return true; // 衝突あり
+                }
+            }
+            return false; // 衝突なし
+        }
+
+        function interact() {
+            for (const villager of villagers) {
+                const distance = Math.hypot(player.x - villager.x, player.y - villager.y);
+                if (distance < villager.size + player.size + TILE_SIZE * 0.8) {
+                    showDialogue(villager.message);
+                    break;
+                }
+            }
+        }
+        
+        function showDialogue(message) {
+            currentDialogue = message;
+            clearTimeout(dialogueTimeout);
+            dialogueTimeout = setTimeout(() => {
+                currentDialogue = null;
+            }, 3000); // 3秒後にダイアログを消す
+        }
+        
+
+        // --- 描画 ---
+        function draw() {
+            // 背景の描画 (昼夜サイクル)
+            const hour = new Date().getHours();
+            let bgColor = '#87CEEB'; // 昼
+            if (hour < 5 || hour > 19) bgColor = '#000080'; // 夜
+            else if (hour < 7 || hour > 17) bgColor = '#FFA500'; // 朝夕
+            
+            ctx.fillStyle = bgColor;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // 地面の描画 (チェック模様)
+            for (let y = 0; y < MAP_HEIGHT_TILES; y++) {
+                for (let x = 0; x < MAP_WIDTH_TILES; x++) {
+                    ctx.fillStyle = (x + y) % 2 === 0 ? '#a7d383' : '#9fca78';
+                    ctx.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+                }
+            }
+
+            // オブジェクトの描画
+            worldObjects.forEach(drawObject);
+            villagers.forEach(drawVillager);
+
+            // プレイヤーの描画
+            ctx.fillStyle = player.color;
+            ctx.beginPath();
+            ctx.arc(player.x, player.y, player.size, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+
+            // ダイアログの描画
+            if (currentDialogue) {
+                drawDialogueBox(currentDialogue);
+            }
+        }
+
+        function drawObject(obj) {
+            if (obj.type === 'tree') {
+                const x = obj.x * TILE_SIZE;
+                const y = obj.y * TILE_SIZE;
+                // 幹
+                ctx.fillStyle = '#8b5e34';
+                ctx.fillRect(x + TILE_SIZE * 0.3, y + TILE_SIZE * 0.5, TILE_SIZE * 0.4, TILE_SIZE * 0.5);
+                // 葉
+                ctx.fillStyle = '#228B22';
+                ctx.beginPath();
+                ctx.arc(x + TILE_SIZE / 2, y + TILE_SIZE * 0.4, TILE_SIZE * 0.6, 0, Math.PI * 2);
+                ctx.fill();
+            } else if (obj.type === 'house') {
+                const x = obj.x * TILE_SIZE;
+                const y = obj.y * TILE_SIZE;
+                const w = obj.width * TILE_SIZE;
+                const h = obj.height * TILE_SIZE;
+                // 壁
+                ctx.fillStyle = '#d2b48c';
+                ctx.fillRect(x, y, w, h);
+                // 屋根
+                ctx.fillStyle = '#c0392b';
+                ctx.beginPath();
+                ctx.moveTo(x - 10, y);
+                ctx.lineTo(x + w + 10, y);
+                ctx.lineTo(x + w / 2, y - h * 0.5);
+                ctx.closePath();
+                ctx.fill();
+            }
+        }
+        
+        function drawVillager(villager) {
+            ctx.fillStyle = villager.color;
+            ctx.beginPath();
+            ctx.arc(villager.x, villager.y, villager.size, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+        }
+
+        function drawDialogueBox(text) {
+            const boxWidth = 300;
+            const boxHeight = 60;
+            const boxX = (canvas.width - boxWidth) / 2;
+            const boxY = canvas.height - boxHeight - 20;
+
+            // 背景
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+            ctx.fillRect(boxX, boxY, boxWidth, boxHeight);
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(boxX, boxY, boxWidth, boxHeight);
+
+            // テキスト
+            ctx.fillStyle = '#fff';
+            ctx.font = '16px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(text, boxX + boxWidth / 2, boxY + boxHeight / 2);
+        }
+
+        // --- ゲームループ ---
+        function gameLoop() {
+            update();
+            draw();
+            requestAnimationFrame(gameLoop);
+        }
+        
+        // --- ゲーム開始 ---
+        window.onload = async () => {
+            await setupFirebase();
+            gameLoop();
+        };
+        
+        window.onbeforeunload = () => {
+            // ページを離れるときにリスナーをクリーンアップ
+            if (unsubscribePlayer) {
+                unsubscribePlayer();
+            }
+        };
+
+    </script>
+</body>
+</html>
